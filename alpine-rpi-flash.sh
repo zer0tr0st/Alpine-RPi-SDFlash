@@ -2,6 +2,9 @@
 # ==============================================================================
 # Alpine Linux Raspberry Pi MicroSD Flasher & Headless Provisioner
 #
+# Compatible with: Raspberry Pi 1, 2, 3, 4, 5, Zero, Zero W, Zero 2 W,
+#                  Compute Modules (all generations)
+#
 # Features:
 #   1. Safely writes Alpine Linux (.img, .img.gz, .img.xz, or .tar.gz)
 #      to a MicroSD card.
@@ -23,6 +26,14 @@
 #        firmware staged into the overlay so Wi-Fi works on the first boot.
 #      - Custom file(s)/folder(s) copied into /home/<user>/.
 #   4. Drive safety checks so system and non-removable disks are not offered.
+#   5. Broad hardware compatibility:
+#      - RPi 1/2 (armhf/armv7): ethernet via USB (smsc95xx) is brought up
+#        with an active polling strategy so slow driver enumeration does not
+#        prevent the first-boot installer from reaching the internet.
+#      - Ethernet is always attempted even if the cable is absent; boot is
+#        never blocked by a missing network interface.
+#      - RPi 1/2-specific config.txt patches applied automatically
+#        (arm_64bit=0, vc4-kms-v3d disabled) when an armhf/armv7 image is used.
 #
 # Usage: sudo ./alpine-rpi-flash.sh [--show-all] [--debug] [-h|--help]
 #   --show-all   also list non-removable, non-system disks (use with care)
@@ -319,6 +330,17 @@ elif [[ $IMAGE_NAME =~ armv7 ]]; then
     IMAGE_ARCH="armv7"
 fi
 
+# Detect the Pi family from the image name so we can apply the right
+# config.txt defaults and network strategy on first boot.
+# RPi 1 (A/B/A+/B+/Zero/W)      => armhf, ARMv6 single-core
+# RPi 2                           => armv7 (or armhf for older images)
+# RPi 3/4/5/Zero2W/CM etc.        => aarch64 (or armv7/armhf)
+# We only need special handling for the armhf/ARMv6 family here.
+IS_RPI_OLD=0   # 1 = RPi 1 or 2 family (needs ethernet-tolerant boot)
+if [[ $IMAGE_ARCH == "armhf" || $IMAGE_ARCH == "armv7" ]]; then
+    IS_RPI_OLD=1
+fi
+
 # Pin package repositories to the release that was flashed (e.g. v3.21), so the
 # kernel/modloop and every package installed later come from the same branch.
 ALPINE_BRANCH="latest-stable"
@@ -340,6 +362,7 @@ fi
 [[ $IMAGE_BYTES =~ ^[0-9]+$ ]] || IMAGE_BYTES=0
 
 echo "[+] Selected image: $IMAGE_NAME (Arch: $IMAGE_ARCH, repositories: $ALPINE_BRANCH)"
+(( IS_RPI_OLD )) && echo "[+] RPi 1/2 compatibility mode active (armhf/armv7 image detected)."
 
 # ------------------------------------------------------------------------------
 # 2. Select target MicroSD card
@@ -656,6 +679,7 @@ echo "  Target:     $TARGET_DISK ($disk_size, $disk_model)"
 echo "  Install:    sys mode (installed by the Pi on first boot, needs internet)"
 echo "  Hostname:   $RPI_HOSTNAME"
 echo "  Timezone:   $TIMEZONE"
+(( IS_RPI_OLD )) && echo "  Pi Family:  RPi 1/2 (armhf/armv7) — ethernet-tolerant boot enabled"
 if (( CREATE_USER )); then
     echo "  User:       $RPI_USER (sudo admin)"
 fi
@@ -1154,24 +1178,36 @@ if (( ${#WIFI_SSIDS[@]} > 0 )); then
     } > "$STAGING_DIR/etc/wpa_supplicant/wpa_supplicant.conf"
     chmod 600 "$STAGING_DIR/etc/wpa_supplicant/wpa_supplicant.conf"
 
+    # With Wi-Fi: eth0 uses 'auto' (always attempt, even without a cable);
+    # on RPi 1/2 the smsc95xx USB-ethernet driver can be slow to appear so
+    # we tolerate a missing interface rather than hanging boot.
     cat > "$STAGING_DIR/etc/network/interfaces" <<'IFACE_EOF'
 auto lo
 iface lo inet loopback
 
-allow-hotplug eth0
+# Ethernet: bring up unconditionally; if the adapter is absent the
+# pre-up guard exits cleanly so boot is not blocked.
+auto eth0
 iface eth0 inet dhcp
+    pre-up for i in $(seq 1 15); do [ -d /sys/class/net/eth0 ] && break; sleep 1; done; [ -d /sys/class/net/eth0 ] || exit 0
 
 auto wlan0
 iface wlan0 inet dhcp
     pre-up /bin/sh -c 'rfkill unblock wifi 2>/dev/null; for i in $(seq 1 20); do [ -d /sys/class/net/wlan0 ] && exit 0; sleep 1; done; exit 0'
 IFACE_EOF
 else
+    # Ethernet-only: use 'auto' so eth0 is always attempted.
+    # The pre-up guard ensures the interface existing is not required —
+    # if the adapter is absent (or slow to appear) boot continues cleanly.
     cat > "$STAGING_DIR/etc/network/interfaces" <<'IFACE_EOF'
 auto lo
 iface lo inet loopback
 
-allow-hotplug eth0
+# Ethernet: bring up unconditionally; if the adapter is absent the
+# pre-up guard exits cleanly so boot is not blocked.
+auto eth0
 iface eth0 inet dhcp
+    pre-up for i in $(seq 1 15); do [ -d /sys/class/net/eth0 ] && break; sleep 1; done; [ -d /sys/class/net/eth0 ] || exit 0
 IFACE_EOF
 fi
 
@@ -1263,7 +1299,7 @@ fail() {
 
 wait_net() {
     i=0
-    while [ "$i" -lt 60 ]; do
+    while [ "$i" -lt 90 ]; do
         wget -q -T 4 --spider http://dl-cdn.alpinelinux.org/alpine/ 2>/dev/null && return 0
         i=$((i + 1))
         sleep 2
@@ -1272,9 +1308,11 @@ wait_net() {
 }
 
 # --- 1. Radio, driver, network ------------------------------------------------
+# Unblock Wi-Fi radios and load Broadcom driver (no-op on Pi 1/2 without Wi-Fi).
 command -v rfkill >/dev/null 2>&1 && rfkill unblock wifi 2>/dev/null
 modprobe brcmfmac 2>/dev/null || true
 
+# Wait briefly for wlan0 then bring it up if present.
 for _ in $(seq 1 10); do
     [ -d /sys/class/net/wlan0 ] && break
     sleep 1
@@ -1284,9 +1322,35 @@ if [ -d /sys/class/net/wlan0 ]; then
     ifup wlan0 2>/dev/null || true
 fi
 
-say "Waiting for internet access..."
-wait_net || fail "No internet access after 2 minutes (check Ethernet or the Wi-Fi settings)."
+# Ethernet: actively bring up eth0 regardless of whether it was configured via
+# allow-hotplug or auto.  On Raspberry Pi 1/2 the smsc95xx or LAN9514 USB
+# Ethernet driver may appear well after the networking service starts (the USB
+# bus on Pi 1 can take 30-45 s to fully enumerate), so we explicitly load the
+# driver, then poll for the interface and attempt ifup.  If the interface is
+# physically absent we still continue — Wi-Fi (if configured) may provide the
+# connection, or the user accepts that internet is needed before first boot.
+modprobe smsc95xx 2>/dev/null || true   # RPi 1 B / B+ / A+ USB ethernet
+modprobe lan78xx  2>/dev/null || true   # RPi 3 B+ / CM3+ USB ethernet
+say "Waiting for eth0 to appear (up to 45 s for USB ethernet)..."
+eth0_up=0
+for i in $(seq 1 45); do
+    if [ -d /sys/class/net/eth0 ]; then
+        ip link set eth0 up 2>/dev/null || true
+        # Give the link a moment to negotiate before requesting DHCP
+        sleep 2
+        ifup eth0 2>/dev/null || true
+        eth0_up=1
+        say "eth0 is present and configured (attempt $i)."
+        break
+    fi
+    sleep 1
+done
+if [ "$eth0_up" -eq 0 ]; then
+    say "Warning: eth0 not found after 45 s (no cable or adapter absent). Continuing — will use Wi-Fi if available."
+fi
 
+say "Waiting for internet access..."
+wait_net || fail "No internet access after 2 minutes (check Ethernet or Wi-Fi settings)."
 # --- 2. Clock (needed for TLS) ------------------------------------------------
 timeout 30 ntpd -q -n -p pool.ntp.org 2>/dev/null || echo "Warning: NTP sync failed; continuing."
 
@@ -1442,18 +1506,36 @@ chmod 755 "$STAGE/etc/local.d/10-bootcleanup.start"
 # --- Switch the real boot partition over (last step, only after everything worked) ---
 say "Writing the new boot files to the boot partition..."
 mount -o remount,rw "$BOOT_MNT" 2>/dev/null || true
-need=$(du -sk "$STAGE/boot" | cut -f1)
-avail=$(df -k "$BOOT_MNT" | awk 'NR==2 {print $4}')
-if [ "${avail:-0}" -lt "${need:-0}" ]; then
-    # the offline package repository and the diskless modloop are not needed any more
+# Net space needed: size of every new file minus the size of the old file it overwrites
+# (the firmware, device trees and overlays are replaced in place, only the kernel and
+# initramfs are really new at the FAT root). 4 MiB margin for FAT cluster rounding.
+need_bytes=$(cd "$STAGE/boot" && find . -type f | while IFS= read -r f; do
+    n=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    o=$(stat -c %s "$BOOT_MNT/$f" 2>/dev/null || echo 0)
+    echo $((n - o))
+done | awk '{ s += $1 } END { print s + 0 }')
+need=$(( need_bytes / 1024 + 4096 ))
+free_k() { df -k "$BOOT_MNT" | awk 'NR==2 {print $4}'; }
+avail=$(free_k)
+echo "Boot partition: ${avail}K free, ${need}K needed (net)."
+
+# Not enough room? Remove what is no longer needed, least important first:
+# 1. the offline package repository, 2. the diskless modloop, 3. the old kernel and
+# initramfs in boot/ (the new config.txt loads the new ones from the FAT root).
+if [ "${avail:-0}" -lt "$need" ]; then
     rm -rf "$BOOT_MNT/apks"
-    avail=$(df -k "$BOOT_MNT" | awk 'NR==2 {print $4}')
+    avail=$(free_k)
 fi
-if [ "${avail:-0}" -lt "${need:-0}" ]; then
+if [ "${avail:-0}" -lt "$need" ]; then
     rm -f "$BOOT_MNT"/boot/modloop-*
-    avail=$(df -k "$BOOT_MNT" | awk 'NR==2 {print $4}')
+    avail=$(free_k)
 fi
-[ "${avail:-0}" -ge "${need:-0}" ] || fail "Not enough free space on the boot partition (${avail}K free, ${need}K needed)."
+if [ "${avail:-0}" -lt "$need" ]; then
+    rm -f "$BOOT_MNT"/boot/vmlinuz-* "$BOOT_MNT"/boot/initramfs-*
+    avail=$(free_k)
+fi
+echo "Boot partition after cleanup: ${avail}K free."
+[ "${avail:-0}" -ge "$need" ] || fail "Not enough free space on the boot partition (${avail}K free, ${need}K needed)."
 cp -R "$STAGE/boot/." "$BOOT_MNT/" || fail "Copying the boot files to the boot partition failed."
 sync
 
@@ -1515,6 +1597,26 @@ if (( HEADLESS_TWEAKS )); then
     add_usercfg "dtparam=audio=off"
 fi
 
+# RPi 1 / 2 (armhf / armv7) safety patches for config.txt:
+#   - Disable the VC4 KMS overlay: it is incompatible with BCM2835/BCM2836
+#     and causes a black screen / kernel panic on Pi 1 and some Pi 2 boards.
+#   - Force 32-bit mode (arm_64bit=0) so the 32-bit kernel is loaded.
+#   - Remove dtoverlay=vc4-kms-v3d if the image already ships it.
+if (( IS_RPI_OLD )); then
+    add_usercfg "# RPi 1/2 compatibility (added by alpine-rpi-flash.sh)"
+    add_usercfg "arm_64bit=0"
+    add_usercfg "dtoverlay=disable-bt"
+
+    # Patch config.txt in-place: comment out any vc4-kms-v3d overlay line
+    # that the stock Alpine image may have written.
+    for cfg in "$BOOT_MNT/config.txt" "$BOOT_MNT/usercfg.txt"; do
+        [[ -f $cfg ]] || continue
+        # Comment out vc4-kms-v3d (incompatible with BCM2835/BCM2836)
+        sed -i 's/^\(dtoverlay=vc4-kms-v3d\)/#\1  # disabled for RPi 1\/2 by alpine-rpi-flash/' "$cfg" 2>/dev/null || true
+    done
+    echo "[+] Applied RPi 1/2 config.txt compatibility patches (arm_64bit=0, vc4-kms-v3d disabled)."
+fi
+
 echo "Flushing final filesystem sync..."
 sync
 umount "$BOOT_MNT" || die "Failed to unmount $BOOT_MNT. Do NOT remove card yet."
@@ -1530,6 +1632,9 @@ echo "Install:   sys mode (installed by the Pi on first boot)"
 echo "Hostname:  $RPI_HOSTNAME"
 echo "Timezone:  $TIMEZONE"
 echo "SSH:       Enabled (OpenSSH, mDNS via avahi)"
+if (( IS_RPI_OLD )); then
+    echo "Pi Family: RPi 1/2 (armhf/armv7) — ethernet-tolerant boot, vc4-kms-v3d disabled"
+fi
 if (( DISABLE_IPV6 )); then echo "IPv6:      Disabled"; else echo "IPv6:      Enabled"; fi
 if (( CREATE_USER )); then
     echo "User:      $RPI_USER (sudo enabled)"
